@@ -1,0 +1,24 @@
+name: Windows executable
+on: [push, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          architecture: x64
+      - name: Test, package and launch
+        shell: pwsh
+        run: ./build.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DNS-Pilot-Windows-x64
+          path: |
+            dist/DNS Pilot.exe
+            README.md
+            GUIDE.md
+            MANUAL-TESTS.md
