@@ -13,7 +13,9 @@ jobs:
         with:
           python-version: '3.14.4'
           architecture: x64
-      - run: python -m pip install --require-hashes --only-binary=:all: -r requirements-win314.lock
+      - name: Install verified wheels
+        run: >-
+          python -m pip install --require-hashes --only-binary=:all: -r requirements-win314.lock
       - run: python -m pip check
       - run: python -m ruff check --select F,E9 app main.py tests tools
       - run: python -m pytest -q
