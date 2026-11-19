@@ -109,7 +109,7 @@ def test_privacy_retention_export_and_legacy_profile(tmp_path):
         p = tmp_path / ("history."+fmt)
         db.export(p, fmt)
         assert "PRIVATE" not in p.read_text("utf-8-sig")
-    assert len(json.loads((tmp_path/"history.json").read_text())) == 2
+    assert len(json.loads((tmp_path/"history.json").read_text(encoding="utf-8"))) == 2
     db.db.execute("INSERT INTO checks(data) VALUES ('invalid-json')")
     assert len(db.records()) == 2
     db.db.close()
