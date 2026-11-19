@@ -1,6 +1,6 @@
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
-from PySide6.QtWidgets import QLabel, QSizePolicy, QWidget
+from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from .appearance import THEMES
 
@@ -167,33 +167,36 @@ class StageChart(QWidget):
         width = (w-26)/4
         maximum = max([v for _,v in stages if v is not None]+[1])
         for i,(stage,value) in enumerate(stages):
+            failed = ((stage == "DNS" and hop.get("dns_ok") is False) or
+                      (stage == attempt.get("stage") and bool(attempt.get("error"))))
+            stage_color = QColor(t.error) if failed else accent
             x = 13 + i*width
             p.setPen(line)
             p.setFont(QFont(t.data_font,9))
             p.drawText(QPointF(x,45),stage)
             p.setFont(QFont(t.data_font,11,QFont.Weight.DemiBold))
-            p.setPen(ink)
+            p.setPen(QColor(t.error) if failed else ink)
             p.drawText(QPointF(x,66),f"{value:.0f} мс" if value is not None else "—")
             bar = QRectF(x,76,width-12,4)
             if self.key == "lab":
                 p.setPen(QPen(QColor(t.border),1))
                 p.drawLine(QPointF(x,79),QPointF(x+width-5,79))
-                p.setBrush(QColor(t.success if value is not None else t.background))
+                p.setBrush(QColor(t.error if failed else t.success if value is not None else t.background))
                 p.drawEllipse(QPointF(x+3,79),4,4)
                 if value is not None:
                     for j in range(round(8*value/maximum)):
-                        p.fillRect(QRectF(x+12+j*(width-23)/8,74,3,8),accent)
+                        p.fillRect(QRectF(x+12+j*(width-23)/8,74,3,8),stage_color)
             elif self.key == "aurora":
                 p.setPen(QPen(QColor(t.border),3))
                 p.drawEllipse(QRectF(x,78,23,23))
                 if value is not None:
-                    p.setPen(QPen(QColor(t.success),3))
+                    p.setPen(QPen(QColor(t.error if failed else t.success),3))
                     p.drawArc(QRectF(x,78,23,23),90*16,-int(5760*value/maximum))
             else:
                 p.fillRect(bar,QColor("#526780" if self.key=="coral" else t.border))
                 if value is not None:
                     bar.setWidth(bar.width()*value/maximum)
-                    p.fillRect(bar,accent)
+                    p.fillRect(bar,stage_color)
         p.end()
 
 

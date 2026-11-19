@@ -133,7 +133,7 @@ def test_pinned_tls_redirects_and_doh(use_doh, final):
         port = listener.sockets[0].getsockname()[1]
         t, dns_port = await udp(answer)
         server = Server("DoH", f"https://resolver.invalid:{port}/dns-query","127.0.0.1") if use_doh else Server("udp","127.0.0.1")
-        checker = Checker(Settings(), client_ssl, dns_port)
+        checker = Checker(Settings(allow_local=True), client_ssl, dns_port)
         try:
             with patch.object(socket, "getaddrinfo", side_effect=AssertionError("Unexpected system resolver")):
                 result = await checker.check(f"https://one.invalid:{port}/start", server)
@@ -146,7 +146,7 @@ def test_pinned_tls_redirects_and_doh(use_doh, final):
             assert ("two.invalid","GET /page?q=1 HTTP/1.1") in requests
             if use_doh:
                 assert "resolver.invalid" in sni and ("resolver.invalid", "POST /dns-query HTTP/1.1") in requests
-            untrusted = Checker(Settings(v6=False), dns_port=dns_port)
+            untrusted = Checker(Settings(v6=False, allow_local=True), dns_port=dns_port)
             failed = await untrusted.check(f"https://one.invalid:{port}",server)
             assert "CERTIFICATE_VERIFY_FAILED" in failed.summary
         finally:
@@ -199,7 +199,7 @@ def test_ipv6_resolver_and_destination():
             pytest.skip(f"IPv6 loopback unavailable: {exc}")
         async with await asyncio.start_server(http,"::1",0,family=socket.AF_INET6) as web:
             try:
-                c = Checker(Settings(v4=False,v6=True), dns_port=udp6.get_extra_info("sockname")[1])
+                c = Checker(Settings(v4=False,v6=True,allow_local=True), dns_port=udp6.get_extra_info("sockname")[1])
                 r = await c.check(f"http://six.invalid:{web.sockets[0].getsockname()[1]}",Server("IPv6","::1"))
                 assert r.success and r.code == 204 and r.hops[0]["ips"] == ["::1"]
                 assert r.hops[0]["queries"][0]["type"] == "AAAA"

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import ipaddress
 import json
 import logging
@@ -22,12 +21,15 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFil
                                QStackedWidget, QTableWidget, QVBoxLayout, QWidget)
 
 from .desktop import BROWSERS, Job, batch, browser_path, open_browser, system_check
-from .diagnostics import Checker, ranking
+from .diagnostics import Checker, ranking, control_site, passed
+from .resolver import verify_interface
+from .privacy import redact
+from . import VERSION
 from .model import PROVIDERS, Server, presets, url
 from .widgets import append, button, card, choose, label, row, selected, table
 from .appearance import THEMES, stylesheet
 from .visuals import LatencyPlot, Rail, StageChart, brand_mark, theme_thumbnail
-from .windows import Manager, addresses, inventory, primary, supports_doh
+from .windows import Manager, addresses, inventory, primary, supports_doh, adapter_kind, protected_adapter
 
 PAGES = ["Главная", "Проверка сайтов", "Сравнение DNS", "DNS-серверы", "Настройки сети", "Браузеры", "История", "Настройки приложения"]
 MODES = {"auto": "автоматически", "manual": "вручную", "unknown": "не удалось определить"}
@@ -70,6 +72,9 @@ def sites_of(field):
 def pretty(record):
     lines = [record["site"], f'{record["name"]} · {record["server"]} · {record["protocol"]}', record.get("dns_status", ""), record["summary"],
              f'Общее время {record["total_ms"]} мс · DNS-тайм-ауты {record["timeouts"]}']
+    lines.extend(record.get("warnings", []))
+    if record.get("final_url"):
+        lines.append("Конечный URL · " + record["final_url"])
     for h in record["hops"]:
         lines += ["", h["url"]]
         for q in h["queries"]:
@@ -100,6 +105,7 @@ class Window(QMainWindow):
         self.changing = self.reading = False
         self.adapters = []
         self.best = None
+        self.selection_revision = 0
         self.results = []
         self.required = set()
         self.selections = [["1.1.1.1"], ["1.1.1.1", "8.8.8.8", "9.9.9.9"]]
@@ -135,7 +141,7 @@ class Window(QMainWindow):
             self.nav.append(b)
             nav.addWidget(b)
         nav.addStretch()
-        self.rail_footer = label("DNS Pilot   /   1.1", "muted")
+        self.rail_footer = label("DNS Pilot   /   " + VERSION, "muted")
         nav.addWidget(self.rail_footer)
         shell.addWidget(side)
         body = QVBoxLayout()
@@ -183,6 +189,9 @@ class Window(QMainWindow):
         self.go(0)
         if detect:
             QTimer.singleShot(0, self.refresh_network)
+            QTimer.singleShot(100, self.offer_recovery)
+        if store.warning:
+            self.stage_line.setText(store.warning)
 
     def go(self, index):
         for i, b in enumerate(self.nav):
@@ -279,6 +288,16 @@ class Window(QMainWindow):
         self.sidebar.setFixedWidth(78 if compact else (218 if self.s.theme == "lab" else 228))
         self.brand.setVisible(not compact)
         self.rail_footer.setVisible(not compact)
+        columns = 1 if self.width() < 850 else 2
+        if getattr(self, "preview_columns", None) != columns:
+            self.preview_columns = columns
+            for i, item in enumerate(self.theme_buttons.values()):
+                self.theme_grid.removeWidget(item)
+                self.theme_grid.addWidget(item, i // columns, i % columns)
+        for viewport_index in range(self.stack.count()):
+            for group in self.stack.widget(viewport_index).findChildren(QWidget, "adaptiveRow"):
+                direction = QHBoxLayout.Direction.TopToBottom if compact else QHBoxLayout.Direction.LeftToRight
+                group.layout().setDirection(direction)
         for i,b in enumerate(self.nav):
             b.setText("" if compact else PAGES[i])
 
@@ -288,6 +307,8 @@ class Window(QMainWindow):
             lay = self.page_layouts[i+1]
             field = multi(self.s.sites)
             self.fields.append(field)
+            if i:
+                field.textChanged.connect(self.invalidate_best)
             pick = button("", lambda n=i: self.pick(n))
             self.pick_buttons.append(pick)
             controls = [pick]
@@ -461,6 +482,13 @@ class Window(QMainWindow):
                     raise ValueError("Введите индивидуальный IP-адрес DNS-сервера.")
         return s
 
+    def invalidate_best(self):
+        self.selection_revision += 1
+        if self.best:
+            self.best_info.setText("Условия изменились. Повторите сравнение DNS.")
+        self.best = None
+        self.best_apply.setEnabled(False)
+
     def update_custom(self, original, replacement):
         network_choice = self.net_profiles.currentData()
         items = [v for v in self.s.custom if Server(**v).address != original]
@@ -472,6 +500,7 @@ class Window(QMainWindow):
         saved = replace(self.s, custom=items)
         self.store.save(saved)
         self.s.custom = items
+        self.invalidate_best()
         existing = {v.address for v in self.servers()}
         if previous:
             changed = {previous.address: replacement.address if replacement else None}
@@ -554,6 +583,8 @@ class Window(QMainWindow):
         picked = choose(self, "Выбор DNS-серверов", [(s.address, s.label) for s in self.servers()], self.selections[index])
         if picked is not None:
             self.selections[index] = picked
+            if index == 1:
+                self.invalidate_best()
             self.pick_labels()
 
     def pick_labels(self):
@@ -566,6 +597,7 @@ class Window(QMainWindow):
         picked = choose(self, "Обязательные сайты", [(v, v) for v in choices], self.required)
         if picked is not None:
             self.required = set(picked)
+            self.invalidate_best()
             self.must.setText(f"Обязательные сайты · {len(picked)}")
 
     def quick_start(self):
@@ -589,7 +621,10 @@ class Window(QMainWindow):
     def start_test(self, servers, sites, compare):
         if self.probe or self.changing:
             raise ValueError("Дождитесь окончания операции или отмените проверку.")
-        must = self.required.intersection(sites)
+        if compare and self.required.difference(sites):
+            raise ValueError("В списке отсутствуют обязательные сайты. Обновите выбор обязательных сайтов.")
+        must = set(self.required) if compare else set()
+        revision = self.selection_revision
         auto = None
         if compare and self.s.auto_apply:
             auto = self.adapter()
@@ -626,7 +661,7 @@ class Window(QMainWindow):
             if compare:
                 self.results, self.ranked_sites, self.ranked_required = results, sites, must
                 ranks = ranking(results, must)
-                self.best = next((r for r in ranks if r["eligible"]), None)
+                self.best = next((r for r in ranks if r["eligible"]), None) if revision == self.selection_revision else None
                 self.draw_ranking()
                 note = "Подходящий DNS не найден."
                 if self.best:
@@ -637,13 +672,39 @@ class Window(QMainWindow):
                 self.rank_note.setText(note + "\nПорядок выбора: обязательные сайты во всех повторах → число успешных HTTPS → доля DNS-ответов NOERROR → меньшая медиана DNS.")
                 if auto and self.best and not self.best["address"].startswith("https:"):
                     addr = self.best["address"]
-                    self.commit(auto, ipaddress.ip_address(addr).version, [addr], sites[0])
+                    self.confirm_winner(auto, addr, results, ranks, must)
         def end():
             self.probe = None
             self.stop.hide()
             self.bar.hide()
             self.refresh_history()
         self.probe = self.job(lambda emit: batch(servers, sites, settings, emit), finished, end=end, progress=self.progress)
+
+    def confirm_winner(self, adapter, addr, results, ranks, required):
+        winner = self.best
+        if not winner or not winner["eligible"]:
+            return
+        if any(other["eligible"] and other["address"] != addr and all(other[k] == winner[k] for k in ("wins","reliability","median")) for other in ranks):
+            self.stage_line.setText("Равные результаты. Выберите DNS вручную.")
+            return
+        group = [r for r in results if r.server == addr]
+        for site in {r.site for r in group}:
+            outcomes = {passed(r) for r in group if r.site == site}
+            if len(outcomes) > 1 or any(r.downgraded or any(h.get("special_ips") for h in r.hops) for r in group if r.site == site):
+                self.stage_line.setText("Неоднозначные результаты. Автоприменение пропущено.")
+                return
+        target = control_site(results, addr, required)
+        family = ipaddress.ip_address(addr).version
+        checks = [f"{site} · {sum(passed(r) for r in results if r.site==site and r.server==addr)} успешных" for site in sorted(required)]
+        details = (self.adapter_text(adapter) + "\nТип · " + adapter_kind(adapter)
+                   + f"\nНовый DNS IPv{family} · {addr}\nМедиана DNS · {winner['median']:.1f} мс"
+                   + f"\nУспешные HTTPS · {winner['wins']/winner['runs']:.0%}\nОбязательные сайты · "
+                   + ("\n".join(checks) or "не выбраны") + "\nКонтрольный домен · " + target)
+        if self.ask("Применить победителя сравнения?", details):
+            if protected_adapter(adapter) and not self.ask("Изменить DNS виртуального подключения?",
+                    adapter["name"] + " · " + adapter_kind(adapter) + "\nИзменение может повлиять на работу VPN."):
+                return
+            self.commit(adapter, family, [addr], target)
 
     def progress(self, event):
         if event[0] == "stage":
@@ -660,8 +721,8 @@ class Window(QMainWindow):
         self.color_result(self.test_table.rowCount()-1)
         self.test_table.selectRow(self.test_table.rowCount()-1)
         self.bar.setValue(self.bar.value()+1)
-        if self.s.detailed:
-            logging.info("%s", pretty(r.record()))
+        if self.s.detailed and self.s.history:
+            logging.info("%s", redact(pretty(r.record())))
 
     def cancel(self):
         if self.probe:
@@ -684,7 +745,7 @@ class Window(QMainWindow):
             cells = []
             for site in sites:
                 group = [v for v in self.results if v.site == site and v.server == r["address"]]
-                https = sum(v.success and v.hops[-1]["url"].startswith("https://") for v in group)
+                https = sum(passed(v) for v in group)
                 cells.append(f"DNS {sum(v.dns_ok for v in group)}/{len(group)} · HTTPS {https}/{len(group)}")
             speed = "—" if not math.isfinite(r["median"]) else f'{r["median"]:.1f}  ' + "▏"*max(1, round(12*r["median"]/max(1,maximum)))
             append(self.rank_table, [r["address"], f'{r["wins"]}/{r["runs"]}', f'{r["reliability"]:.0%}', speed, *cells], r["address"])
@@ -719,6 +780,8 @@ class Window(QMainWindow):
         self.family.addItems(["IPv4", "IPv6"])
         self.pref, self.alt = edit("Основной DNS"), edit("Резервный DNS (необязательно)")
         self.net_profiles = QComboBox()
+        self.net_profiles.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.nic.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.net_profiles.activated.connect(self.load_network_profile)
         self.pref.textEdited.connect(self.detach_network_profile)
         self.alt.textEdited.connect(self.detach_network_profile)
@@ -729,6 +792,9 @@ class Window(QMainWindow):
                            row(button("Применить…", self.ask_apply, "primary"), button("Автоматически (DHCP)…", lambda: self.ask_apply("auto"))),
                            row(button("Вернуть исходные настройки…", lambda: self.ask_apply("restore")),
                                button("Вернуть предыдущие…", lambda: self.ask_apply("previous")))))
+        self.recovery_button = button("Восстановление DNS…", self.offer_recovery)
+        self.recovery_button.setVisible(self.manager.journal.exists())
+        lay.addWidget(self.recovery_button)
         self.sys_doh = label(("Откройте свойства нужного подключения → Назначение DNS-сервера → Изменить. Выберите IPv4 или IPv6, введите IP и включите DNS через HTTPS. Для своего сервера укажите шаблон вручную."
                                if supports_doh() else "В этой версии Windows системная настройка DoH через «Параметры» недоступна. Прямая диагностика DoH и настройка браузера доступны."), "muted")
         self.win_endpoint = QComboBox()
@@ -820,14 +886,18 @@ class Window(QMainWindow):
         if a["virtual"]:
             typ += " · виртуальный"
         state = "Подключено" if a["up"] else "Отключено"
+        if protected_adapter(a):
+            typ = adapter_kind(a)
         dns = a["v4"] + a["v6"]
         self.banner.setText(f'{typ}   /   {a["name"]}   ·   {a.get("ssid") or state}   ·   DNS {dns[0] if dns else "—"}')
         self.net_name.setText(a["name"])
         self.net_info.setText(typ + " · " + state + ("\nSSID · " + (a["ssid"] or "нет данных") if a["type"] == 71 else ""))
         self.dns_name.setText(dns[0] if dns else "Нет адресов")
-        self.dns_info.setText("Резервный · " + (dns[1] if len(dns)>1 else "—") + "\nIPv4 " + MODES[a["mode4"]] + " · IPv6 " + MODES[a["mode6"]])
+        self.dns_info.setText(self.adapter_text(a).split("\n", 1)[1])
         proxies = urllib.request.getproxies()
         route_note = "Прямая диагностика обходит системный HTTP-прокси." if proxies else "Диагностика использует прямое соединение."
+        if protected_adapter(a):
+            route_note += " Выбрано виртуальное подключение. Можно выбрать физический адаптер вручную."
         self.nic_note.setText(self.adapter_text(a) + "\nАдреса интерфейса · " + (", ".join(a["ips"]) or "—") +
                               "\nТранспорт системных запросов не подтверждён. " + route_note +
                               (" VPN и фильтры могут менять маршрут." if any(i["up"] and i["virtual"] for i in self.adapters) else ""))
@@ -862,41 +932,79 @@ class Window(QMainWindow):
                     "\nПроверка через Windows · " + target):
             self.commit(a, family, values, target, rollback=mode == "previous")
 
+    def offer_recovery(self):
+        if self.changing or self.probe:
+            return
+        op = self.manager.pending()
+        if not op:
+            self.recovery_button.hide()
+            return
+        self.recovery_button.show()
+        self.go(4)
+        before = op["before"]
+        self.stage_line.setText("Требуется восстановление DNS")
+        if not self.ask("Восстановить настройки до незавершённой операции?",
+                        self.adapter_text(before) + f"\nСемейство IPv{op['family']} · этап {op['phase']}"):
+            return
+        self.changing = True
+
+        def end():
+            self.changing = False
+            self.refresh_network()
+
+        def restored(_):
+            self.recovery_button.hide()
+            self.stage_line.setText("Windows подтвердила исходные настройки DNS")
+
+        self.job(lambda _: asyncio.to_thread(self.manager.recover), restored, end=end)
+
     def commit(self, adapter, family, values, target, rollback=False):
         if self.changing:
             return
+        host = urlsplit(url(target)).hostname
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("Для проверки применения нужен домен.")
         self.changing = True
+        settings = replace(self.s)
         self.stage_line.setText("Сохранение конфигурации и запрос прав Windows…")
+
         async def work(emit):
-            after = await asyncio.to_thread(self.manager.apply, adapter, family, values, rollback=rollback)
-            emit("Windows подтвердила DNS. Проверяется доступ через системный резолвер…")
-            return after, await system_check(target, self.s)
-        retry = []
+            after = await asyncio.to_thread(self.manager.apply, adapter, family, values,
+                                            rollback=rollback, defer_completion=True)
+            emit("Windows подтвердила адреса. Проверяется DNS интерфейса и системное соединение…")
+            try:
+                ips = await verify_interface(host, after["index"], settings)
+                result = await system_check(target, settings)
+                if not any(h.get("system_lookup") for h in result.hops) or result.code is None:
+                    raise ValueError("Системная проверка · " + result.summary)
+                await asyncio.to_thread(self.manager.complete)
+            except Exception:
+                op = self.manager.pending()
+                if op:
+                    self.manager.phase(op, "recovery")
+                raise
+            return after, ips, result
+
         def done(pair):
-            _after, result = pair
-            self.stage_line.setText("DNS подтверждён Windows · " + result.summary)
-            if result.code is None and not rollback:
-                retry.append((result.summary, _after))
-            else:
-                self.text_dialog("Результат применения", self.adapter_text(_after) + "\n\nПроверка системным резолвером Windows\n" + pretty(result.record()))
-        def failed(err):
-            self.stage_line.setText(err)
-            if not rollback and self.manager.path(adapter["guid"], family).with_suffix(".previous.json").exists() and "Повторное чтение" in err:
-                retry.append((err, None))
-            else:
-                self.warn(err)
+            after, ips, result = pair
+            self.stage_line.setText("Настройки DNS подтверждены Windows · " + result.summary)
+            self.text_dialog("Результат применения", self.adapter_text(after)
+                             + "\nDNS интерфейса без кеша · " + ", ".join(ips)
+                             + "\nСистемная проверка Windows\n" + pretty(result.record()))
+
+        def failed(error):
+            self.stage_line.setText(error)
+            self.warn(error or "Проверка DNS не завершена")
+
         def end():
             self.changing = False
-            if retry and self.ask("Восстановить предыдущий DNS?", retry[0][0] + "\nОткат затронет только выбранное семейство этого адаптера."):
-                before = self.manager.saved(adapter["guid"], family, previous=True)
-                def revert(fresh):
-                    self.commit(fresh, family, before, target, rollback=True)
-                if retry[0][1]:
-                    revert(retry[0][1])
-                else:
-                    self.job(lambda _: asyncio.to_thread(self.manager.current, adapter["guid"]), revert)
-            else:
-                self.refresh_network()
+            self.refresh_network()
+            self.offer_recovery()
+
         self.job(work, done, progress=self.stage_line.setText, error=failed, end=end)
 
     def preview_best(self):
@@ -913,8 +1021,7 @@ class Window(QMainWindow):
         self.detach_network_profile()
         self.pref.setText(addr)
         self.alt.clear()
-        if self.ranked_sites:
-            self.check_site.setText(self.ranked_sites[0])
+        self.check_site.setText(control_site(self.results, addr, self.ranked_required))
         self.ask_apply()
 
     def browsers(self):
@@ -994,14 +1101,19 @@ class Window(QMainWindow):
     def export(self, fmt):
         path, _ = QFileDialog.getSaveFileName(self, "Сохранить историю", "DNS Pilot." + fmt, fmt.upper() + " (*." + fmt + ")")
         if path:
-            self.store.export(Path(path), fmt)
-            self.stage_line.setText("История экспортирована")
+            if self.store.persistent:
+                self.job(lambda _: asyncio.to_thread(self.store.export, Path(path), fmt),
+                         lambda _: self.stage_line.setText("История экспортирована"))
+            else:
+                self.store.export(Path(path), fmt)
+                self.stage_line.setText("История экспортирована")
 
     def settings_page(self):
         lay = self.page_layouts[7]
         self.theme_buttons = {}
         grid = QGridLayout()
         picker = QWidget()
+        self.theme_grid = grid
         picker.setLayout(grid)
         for i,(key,tokens) in enumerate(THEMES.items()):
             b = button(tokens.name, lambda k=key: self.apply_theme(k), "preview")
@@ -1011,17 +1123,23 @@ class Window(QMainWindow):
             grid.addWidget(b,i//2,i%2)
             self.theme_buttons[key] = b
         lay.addWidget(card("Оформление", picker))
-        self.logs = check("Подробный вывод и технический журнал", self.s.detailed)
+        self.logs = check("Подробный журнал", self.s.detailed)
         self.keep = check("Сохранять историю проверок", self.s.history)
-        self.auto = check("Предлагать однократное автоприменение перед подбором", self.s.auto_apply)
+        self.auto = check("Предлагать автоприменение", self.s.auto_apply)
         self.v4, self.v6 = check("IPv4 (A)", self.s.v4), check("IPv6 (AAAA)", self.s.v6)
+        self.local = check("Разрешать локальные адреса", self.s.allow_local)
+        self.downgrade = check("Блокировать переход HTTPS → HTTP", self.s.block_downgrade)
+        self.deep = check("Читать до 16 КиБ ответа", self.s.deep_http)
+        self.local.setToolTip("Разрешить подключения к локальным и служебным адресам для диагностики собственной сети.")
+        self.auto.setToolTip("Одна серия проверок. Перед изменением Windows будет показано итоговое подтверждение.")
+        self.retention = spin(self.s.history_limit, 100000)
         self.dt, self.wt = spin(self.s.dns_timeout, 30), spin(self.s.web_timeout, 60)
         self.reps, self.workers = spin(self.s.repeats, 10), spin(self.s.parallel, 20)
         self.defaults = multi(self.s.sites)
-        lay.addWidget(card("История и журнал", self.keep, self.logs))
+        lay.addWidget(card("История и журнал", self.keep, self.logs, row(label("Максимум записей"), self.retention)))
         lay.addWidget(card("Параметры диагностики", row(label("Тайм-аут DNS, с"), self.dt, label("Тайм-аут этапа HTTPS, с"), self.wt),
                            row(label("Повторов"), self.reps, label("Параллельных проверок"), self.workers),
-                           row(self.v4, self.v6), self.auto))
+                           row(self.v4, self.v6), self.local, self.downgrade, self.deep, self.auto))
         lay.addWidget(card("Сайты по умолчанию", self.defaults))
         lay.addWidget(button("Сохранить настройки", self.save_settings, "primary"))
         lay.addStretch()
@@ -1029,7 +1147,7 @@ class Window(QMainWindow):
     def color_result(self, index):
         result = self.test_table.item(index, 0).data(Qt.ItemDataRole.UserRole)
         t = THEMES[self.s.theme]
-        color = t.success if result["success"] else t.warning if result["code"] else t.error
+        color = t.warning if result.get("warnings") else t.success if result["success"] else t.warning if result["code"] else t.error
         self.test_table.item(index, 5).setForeground(QColor(color))
 
     def apply_theme(self, key, *, persist=True):
@@ -1082,17 +1200,21 @@ class Window(QMainWindow):
         sites_of(self.defaults)
         if not self.v4.isChecked() and not self.v6.isChecked():
             raise ValueError("Выберите IPv4 или IPv6.")
-        for name, widget in (("v4",self.v4),("v6",self.v6),("detailed",self.logs),
+        draft = replace(self.s)
+        for name, widget in (("allow_local",self.local),("block_downgrade",self.downgrade),("deep_http",self.deep),("v4",self.v4),("v6",self.v6),("detailed",self.logs),
                              ("auto_apply",self.auto),("history",self.keep)):
-            setattr(self.s, name, widget.isChecked())
-        for name, widget in (("dns_timeout",self.dt),("web_timeout",self.wt),("parallel",self.workers),("repeats",self.reps)):
-            setattr(self.s, name, widget.value())
+            setattr(draft, name, widget.isChecked())
+        for name, widget in (("history_limit",self.retention),("dns_timeout",self.dt),("web_timeout",self.wt),("parallel",self.workers),("repeats",self.reps)):
+            setattr(draft, name, widget.value())
         old = self.s.sites
-        self.s.sites = self.defaults.toPlainText()
+        draft.sites = self.defaults.toPlainText()
+        self.store.save(draft)
+        self.s = draft
+        self.store.limit(draft.history_limit)
+        self.invalidate_best()
         for field in self.fields:
             if field.toPlainText() == old:
                 field.setPlainText(self.s.sites)
-        self.store.save(self.s)
         self.live_detail.setVisible(self.s.detailed)
         self.stage_line.setText("Настройки сохранены")
 
@@ -1125,7 +1247,7 @@ class Window(QMainWindow):
     def copy_table(self, t):
         record = selected(t)
         if record:
-            self.copy(pretty(record))
+            self.copy(redact(pretty(record)))
 
     def text_dialog(self, title, text):
         d = QDialog(self)
@@ -1135,7 +1257,7 @@ class Window(QMainWindow):
         field = QPlainTextEdit(text)
         field.setReadOnly(True)
         lay.addWidget(field)
-        lay.addWidget(row(button("Скопировать", lambda: self.copy(text)), button("Закрыть", d.accept)))
+        lay.addWidget(row(button("Скопировать", lambda: self.copy(redact(text))), button("Закрыть", d.accept)))
         d.exec()
 
     def copy(self, value):

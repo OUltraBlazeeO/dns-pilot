@@ -13,7 +13,7 @@ def ms(start: float) -> float:
 
 
 async def exchange(target: str, address: str, timeout: float, context: ssl.SSLContext,
-                   trace: dict, stage, payload: bytes | None = None) -> tuple[int, dict, bytes]:
+                   trace: dict, stage, *, deep: bool = False) -> tuple[int, dict, bytes]:
     u = urlsplit(target)
     writer = None
     ip = str(ipaddress.ip_address(address))
@@ -35,16 +35,13 @@ async def exchange(target: str, address: str, timeout: float, context: ssl.SSLCo
             trace["tls_ms"] = ms(start)
             trace["tls_version"] = writer.get_extra_info("ssl_object").version()
         start = begin("HTTP")
-        headers = [("Host", u.netloc), ("Connection", "close"), ("User-Agent", "DNS-Pilot/1.0")]
-        if payload is not None:
-            headers.extend([("Content-Type", "application/dns-message"), ("Accept", "application/dns-message"),
-                            ("Content-Length", str(len(payload)))])
+        headers = [("Host", u.netloc), ("Connection", "close"), ("User-Agent", "DNS-Pilot/1.2")]
+        if deep:
+            headers.append(("Accept-Encoding", "identity"))
         path = u.path + ("?" + u.query if u.query else "")
         conn = h11.Connection(h11.CLIENT, max_incomplete_event_size=65536)
         async with asyncio.timeout(timeout):
-            writer.write(conn.send(h11.Request(method="POST" if payload is not None else "GET", target=path, headers=headers)))
-            if payload is not None:
-                writer.write(conn.send(h11.Data(data=payload)))
+            writer.write(conn.send(h11.Request(method="GET", target=path, headers=headers)))
             writer.write(conn.send(h11.EndOfMessage()))
             await writer.drain()
             body = bytearray()
@@ -56,14 +53,18 @@ async def exchange(target: str, address: str, timeout: float, context: ssl.SSLCo
                 elif isinstance(event, h11.Response):
                     response = (event.status_code, dict(event.headers))
                     trace.update(http_ms=ms(start), code=event.status_code)
-                    if payload is None:
+                    trace["content_type"] = response[1].get(b"content-type", b"").decode("latin-1")
+                    if not deep:
                         return *response, b""
                 elif isinstance(event, h11.Data):
-                    body.extend(event.data)
-                    if len(body) > 65535:
-                        raise ValueError("Слишком большой ответ DoH.")
+                    body.extend(event.data[:16384-len(body)])
+                    trace["sample_bytes"] = len(body)
+                    if len(body) >= 16384:
+                        trace["sample_limit"] = True
+                        return *response, b""
                 elif isinstance(event, h11.EndOfMessage) and response:
-                    return *response, bytes(body)
+                    trace["sample_bytes"] = len(body)
+                    return *response, b""
                 elif isinstance(event, h11.ConnectionClosed) or event is h11.PAUSED:
                     raise ConnectionError("Сервер закрыл соединение.")
     finally:

@@ -9,6 +9,7 @@ from PySide6.QtCore import QLockFile, QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from app.privacy import PrivateFormatter
 from app.model import Settings
 from app.storage import Store
 from app.ui import Window
@@ -33,10 +34,12 @@ def main():
         return 1
     logging.basicConfig(level=logging.INFO, handlers=[RotatingFileHandler(root / "pilot.log", maxBytes=500000,
                         backupCount=2, encoding="utf-8")], format="%(asctime)s %(levelname)s %(message)s")
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(PrivateFormatter("%(asctime)s %(levelname)s %(message)s"))
     store = Store(root)
     try:
         settings = store.settings()
-    except (ValueError, TypeError, KeyError) as exc:
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
         from datetime import datetime
         backup = root / ("settings.damaged-" + datetime.now().strftime("%Y%m%d%H%M%S") + ".json")
         (root / "settings.json").replace(backup)
@@ -59,6 +62,9 @@ def main():
             import dns.message
             import dns.rrset
             from app.diagnostics import Checker
+            import h2.connection
+            import httpcore._async.http2
+            assert h2.connection.H2Connection and httpcore._async.http2.AsyncHTTP2Connection
             Checker(settings)
             dns.asyncbackend.get_backend("asyncio")
             assert dns.message.from_wire(dns.message.make_query("example.org.", "AAAA").to_wire()).question
@@ -75,9 +81,10 @@ def main():
                     adapters = await asyncio.to_thread(inventory)
                     assert any(a["up"] for a in adapters)
                     cfg = Settings(repeats=1, v6=False)
-                    return await batch(presets()[:2], ["https://github.com/"], cfg, emit)
+                    servers = presets()[:2] + [s for s in presets() if s.doh and s.name == "Quad9"]
+                    return await batch(servers, ["https://github.com/"], cfg, emit)
                 def complete(results):
-                    if len(results) == 2 and all(r.success and r.dns_ok for r in results):
+                    if len(results) == 3 and all(r.success and r.dns_ok for r in results):
                         QTimer.singleShot(0, window.close)
                     else:
                         app.exit(3)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import idna
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -11,24 +12,35 @@ def url(value: str, *, doh: bool = False) -> str:
     value = value.strip()
     if not value or any(ord(c) < 33 or c == "\\" for c in value):
         raise ValueError("Введите домен или URL без пробелов.")
-    if "://" not in value:
+    if not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", value):
         if doh:
             raise ValueError("Для DoH нужен полный HTTPS URL.")
         value = "https://" + value
     u = urlsplit(value)
     if u.scheme not in (("https",) if doh else ("http", "https")) or u.username is not None or not u.hostname:
         raise ValueError("Допустим HTTP(S) URL без логина и пароля.")
-    host = u.hostname.encode("idna").decode("ascii").rstrip(".")
+    host = u.hostname.rstrip(".")
     try:
         ip = ipaddress.ip_address(host)
         host = f"[{ip}]" if ip.version == 6 else str(ip)
     except ValueError:
+        try:
+            host = idna.encode(host, uts46=True, transitional=False, std3_rules=True).decode("ascii")
+        except idna.IDNAError as exc:
+            raise ValueError("Недопустимое международное имя узла.") from exc
         if len(host) > 253 or not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", x) for x in host.split(".")):
             raise ValueError("Недопустимое имя узла.") from None
     if u.port == 0:
         raise ValueError("Недопустимый номер порта.")
     authority = host + (f":{u.port}" if u.port else "")
     return urlunsplit((u.scheme, authority, quote(u.path or "/", safe="/%:@!$&'()*+,;=-._~"), quote(u.query, safe="/?%:@!$&'()*+,;=-._~"), ""))
+
+
+def dns_ip(value: str):
+    ip = ipaddress.ip_address(value)
+    if ip.is_unspecified or ip.is_multicast or str(ip) == "255.255.255.255":
+        raise ValueError("Введите индивидуальный адрес DNS-сервера.")
+    return ip
 
 
 @dataclass(frozen=True)
@@ -39,12 +51,14 @@ class Server:
     secondary: str = ""
 
     def __post_init__(self):
+        if not all(isinstance(v, str) for v in (self.name, self.address, self.bootstrap, self.secondary)):
+            raise ValueError("Поля профиля DNS должны содержать текст.")
         addr = self.address.strip()
         if "://" in addr:
             addr = url(addr, doh=True)
         else:
             try:
-                addr = str(ipaddress.ip_address(addr))
+                addr = str(dns_ip(addr))
             except ValueError as exc:
                 raise ValueError("Введите IPv4, IPv6 или полный HTTPS URL для DoH.") from exc
         object.__setattr__(self, "address", addr)
@@ -52,7 +66,7 @@ class Server:
             if self.doh:
                 raise ValueError("Резервный IP указывается для обычного DNS.")
             try:
-                backup = ipaddress.ip_address(self.secondary.strip())
+                backup = dns_ip(self.secondary.strip())
             except ValueError as exc:
                 raise ValueError("Введите корректный резервный IP-адрес.") from exc
             primary = ipaddress.ip_address(addr)
@@ -64,7 +78,7 @@ class Server:
         if self.bootstrap:
             if not self.doh:
                 raise ValueError("Bootstrap IP используется только для DoH.")
-            object.__setattr__(self, "bootstrap", str(ipaddress.ip_address(self.bootstrap.strip())))
+            object.__setattr__(self, "bootstrap", str(dns_ip(self.bootstrap.strip())))
         if not self.name.strip():
             raise ValueError("Введите название сервера.")
 
@@ -106,6 +120,10 @@ class Settings:
     parallel: int = 4
     v4: bool = True
     v6: bool = True
+    allow_local: bool = False
+    block_downgrade: bool = True
+    deep_http: bool = False
+    history_limit: int = 2000
     history: bool = True
     detailed: bool = False
     auto_apply: bool = False
@@ -132,6 +150,9 @@ class Result:
     answered: int = 0
     timeouts: int = 0
     code: int | None = None
+    warnings: list[str] = field(default_factory=list)
+    final_url: str = ""
+    downgraded: bool = False
     hops: list[dict] = field(default_factory=list)
 
     def record(self):

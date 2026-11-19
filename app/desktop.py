@@ -9,6 +9,7 @@ from PySide6.QtCore import QThread, Signal
 
 from .diagnostics import Checker
 from .model import url
+from .resolver import system_addresses
 
 
 class Job(QThread):
@@ -50,11 +51,11 @@ class Job(QThread):
 
 async def batch(servers, sites, settings, emit):
     checker = Checker(settings)
-    semaphore = asyncio.Semaphore(settings.parallel)
+    pairs = iter((server, site) for server in servers for site in sites)
     results = []
 
-    async def pair(server, site):
-        async with semaphore:
+    async def worker():
+        for server, site in pairs:
             for i in range(settings.repeats):
                 tag = f"{server.name} · {site} · {i+1}/{settings.repeats}"
                 def stage(name):
@@ -63,9 +64,8 @@ async def batch(servers, sites, settings, emit):
                 results.append(result)
                 emit(("result", result))
     async with asyncio.TaskGroup() as group:
-        for server in servers:
-            for site in sites:
-                group.create_task(pair(server, site))
+        for _ in range(min(settings.parallel, len(servers)*len(sites))):
+            group.create_task(worker())
     return results
 
 
@@ -76,10 +76,11 @@ async def system_check(site, settings):
             family = socket.AF_UNSPEC if settings.v4 and settings.v6 else (socket.AF_INET if settings.v4 else socket.AF_INET6)
             try:
                 async with asyncio.timeout(settings.dns_timeout):
-                    peers = await asyncio.get_running_loop().getaddrinfo(host, None, family=family, type=socket.SOCK_STREAM)
+                    peers = await system_addresses(host, family)
             except (TimeoutError, OSError) as exc:
                 raise ConnectionError("Системный резолвер Windows: " + (str(exc) or "тайм-аут")) from exc
-            return list(dict.fromkeys(p[4][0] for p in peers))
+            hop["system_lookup"] = True
+            return peers
     from types import SimpleNamespace
     system = SimpleNamespace(name="Windows", address="Системный резолвер", doh=False)
     result = await SystemChecker(settings).check(url(site), system)
