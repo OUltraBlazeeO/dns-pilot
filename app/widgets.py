@@ -1,5 +1,5 @@
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+from PySide6.QtWidgets import (QAbstractItemView, QDialog, QDialogButtonBox,
                                QHBoxLayout, QHeaderView, QLabel, QListWidget, QListWidgetItem,
                                QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
@@ -23,6 +23,7 @@ def button(text, action, role=""):
 
 def row(*widgets):
     w = QWidget()
+    w.setObjectName("adaptiveRow")
     layout = QHBoxLayout(w)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(10)

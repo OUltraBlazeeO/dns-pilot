@@ -4,7 +4,10 @@ import ctypes
 import ipaddress
 import json
 import os
-import socket
+import hashlib
+import threading
+
+from .model import dns_ip
 import subprocess
 import sys
 import uuid
@@ -170,20 +173,51 @@ def primary(adapters):
 def addresses(family, values):
     if family not in (4, 6):
         raise ValueError("Неизвестное семейство IP.")
-    ips = [ipaddress.ip_address(x) for x in values]
+    ips = [dns_ip(x) for x in values]
     if any(ip.version != family or ip.is_unspecified or ip.is_multicast or "%" in str(ip) for ip in ips):
         raise ValueError(f"Введите адрес DNS IPv{family} без идентификатора зоны.")
     return list(dict.fromkeys(str(ip) for ip in ips))
 
 
+def process_birth():
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    times = [wintypes.FILETIME() for _ in range(4)]
+    if not kernel.GetProcessTimes(wintypes.HANDLE(-1), *(ctypes.byref(t) for t in times)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+
+
+def wait_for_writer(identity):
+    """An already authorised writer may briefly outlive the desktop process."""
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel.CreateMutexW.restype = wintypes.HANDLE
+    handle = kernel.CreateMutexW(None, False, r"Local\DNSPilot-" + guid(identity))
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    handle = wintypes.HANDLE(handle)
+    try:
+        status = kernel.WaitForSingleObject(handle, 10000)
+        if status not in (0, 0x80):
+            raise RuntimeError("Предыдущая запись Windows ещё не завершена. Повторите восстановление.")
+        kernel.ReleaseMutex(handle)
+    finally:
+        kernel.CloseHandle(handle)
+
+
 def change(adapter, family, values):
     # Pass data separately from the fixed elevated command. Resolve the GUID again after UAC.
-    payload = dict(guid=guid(adapter["guid"]), family=f"IPv{family}", values=addresses(family, values),
+    payload = dict(owner=os.getpid(), birth=str(process_birth()), guid=guid(adapter["guid"]), family=f"IPv{family}", values=addresses(family, values),
                    expected=adapter[f"v{family}"], mode=adapter[f"mode{family}"])
     blob = base64.b64encode(json.dumps(payload).encode()).decode("ascii")
     elevated = PREAMBLE + "$payload='" + blob + "'\n" + r"""
 try {
   $p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
+  $gate = [Threading.Mutex]::new($false, ('Local\DNSPilot-' + $p.guid))
+  try { $held = $gate.WaitOne(10000) } catch [Threading.AbandonedMutexException] { $held = $true }
+  if (!$held) {exit 22}
+  $owner = Get-Process -Id $p.owner -ErrorAction SilentlyContinue
+  if (!$owner -or $owner.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -ne $p.birth) {exit 22}
   $a = @(Get-NetAdapter -IncludeHidden | Where-Object { [guid]$_.InterfaceGuid -eq [guid]$p.guid })
   if ($a.Count -ne 1) {exit 21}
   $obj = Get-DnsClientServerAddress -InterfaceIndex $a[0].ifIndex -AddressFamily $p.family
@@ -192,6 +226,11 @@ try {
   $path = "HKLM:\SYSTEM\CurrentControlSet\Services\$service\Parameters\Interfaces\" + $p.guid
   $raw = (Get-ItemProperty -LiteralPath $path).NameServer
   if (([bool]$raw) -ne ($p.mode -eq 'manual')) {exit 22}
+  $enc = "HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\InterfaceSpecificParameters\" + $p.guid + "\DohInterfaceSettings"
+  if (Test-Path -LiteralPath $enc) {
+    $key = Get-Item -LiteralPath $enc
+    if ($key.SubKeyCount -or $key.ValueCount) {exit 22}
+  }
   if (@($p.values).Count -gt 0) {
     $obj | Set-DnsClientServerAddress -ServerAddresses ([string[]]$p.values) -ErrorAction Stop
   } else { $obj | Set-DnsClientServerAddress -ResetServerAddresses -ErrorAction Stop }
@@ -200,6 +239,9 @@ try {
   $status = $_.Exception.HResult
   if ($status) {exit $status}
   exit 23
+} finally {
+  if ($held) { $gate.ReleaseMutex() }
+  if ($gate) { $gate.Dispose() }
 }
 """
     args = encoded(elevated)
@@ -211,14 +253,73 @@ try {
 } catch { Write-Output 24 }
 """.replace("TOKEN", args)
     code = ps(outer, timeout=None)  # Keep ownership of the operation throughout the UAC prompt.
+    if code == "24":
+        raise PermissionError("Повышение прав отменено или недоступно.")
     if code != "0":
         raise RuntimeError({"21": "Адаптер исчез.", "22": "Конфигурация изменилась. Обновите данные.",
                             "23": "Windows отклонила изменение DNS.", "24": "Повышение прав отменено или недоступно."}.get(code, "Ошибка изменения DNS Windows · код " + code))
 
 
+def adapter_kind(a):
+    name = (a.get("name", "") + " " + a.get("description", "")).lower()
+    if a.get("type") in (23, 131):
+        return "Туннель / VPN"
+    if a.get("virtual") and any(x in name for x in ("warp", "vpn", "wireguard", "wintun", "tap-windows")):
+        return "VPN"
+    if a.get("virtual"):
+        return "Виртуальный адаптер"
+    return {71: "Wi-Fi", 6: "Ethernet"}.get(a.get("type"), "Физический адаптер")
+
+
+def protected_adapter(a):
+    return bool(a.get("virtual") or a.get("type") in (23, 131))
+
+
+def digest(data):
+    payload = json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def seal(data):
+    data = dict(data, schema=2)
+    return dict(data, sha256=digest(data))
+
+
+def validated(path, legacy=False):
+    data = json.loads(path.read_text("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Недопустимый формат снимка DNS.")
+    if legacy and "schema" not in data and "sha256" not in data:
+        return data
+    checksum = data.pop("sha256", None)
+    if data.get("schema") != 2 or checksum != digest(data):
+        raise ValueError("Нарушена целостность записи DNS. Сохраните её для ручной проверки.")
+    return data
+
+
+def desired(snapshot, family):
+    mode = snapshot.get(f"mode{family}")
+    raw = snapshot.get(f"v{family}")
+    if mode not in ("manual", "auto") or not isinstance(raw, list) or not all(isinstance(v, str) for v in raw):
+        raise ValueError("Некорректный снимок DNS.")
+    if mode == "manual" and not raw:
+        raise ValueError("Пустой список в снимке ручного DNS.")
+    return addresses(family, raw) if mode == "manual" else []
+
+
+def unchanged(other, before, family):
+    alt = 6 if family == 4 else 4
+    return (other.get("encryption") == before.get("encryption") and
+            other.get("templates") == before.get("templates") and
+            other.get(f"mode{alt}") == before.get(f"mode{alt}") and
+            other.get(f"v{alt}") == before.get(f"v{alt}"))
+
+
 class Manager:
     def __init__(self, root, read=inventory, write=change):
         self.root, self.read, self.write = Path(root), read, write
+        self.journal = self.root / "backups" / "operation.json"
+        self.lock = threading.RLock()
 
     def path(self, identity, family):
         return self.root / "backups" / f"{guid(identity)}-v{family}.json"
@@ -229,31 +330,106 @@ class Manager:
             raise ValueError("Адаптер исчез. Обновите список.")
         return found
 
-    def apply(self, preview, family, values, *, rollback=False):
+    def pending(self):
+        if not self.journal.exists():
+            return None
+        op = validated(self.journal)
+        desired(op["before"], op["family"])
+        if op["phase"] == "completed":
+            self.journal.unlink()
+            return None
+        return op
+
+    def phase(self, op, name):
+        op["phase"] = name
+        atomic(self.journal, seal(op))
+
+    def complete(self):
+        with self.lock:
+            op = self.pending()
+            if not op or op["phase"] != "verifying":
+                raise RuntimeError("Операция DNS не готова к завершению.")
+            before, family = op["before"], op["family"]
+            current = self.current(before["guid"])
+            if desired(current, family) != op["values"] or not unchanged(current, before, family):
+                self.phase(op, "recovery")
+                raise RuntimeError("Повторное чтение Windows не подтвердило итоговую конфигурацию.")
+            if not op["rollback"]:
+                path = self.path(op["before"]["guid"], op["family"])
+                atomic(path.with_suffix(".previous.json"), seal(op["before"]))
+            self.phase(op, "completed")
+            self.journal.unlink()
+
+    def recover(self):
+        """Called only after the user has reviewed and confirmed the pending snapshot."""
+        with self.lock:
+            op = self.pending()
+            if not op:
+                return None
+            before, family = op["before"], op["family"]
+            if self.write is change:
+                wait_for_writer(before["guid"])
+            current = self.current(before["guid"])
+            previous = desired(before, family)
+            actual = desired(current, family)
+            if not unchanged(current, before, family):
+                raise ValueError("Изменились параметры шифрования или другого семейства. Требуется ручная сверка.")
+            if actual != previous:
+                if actual != op["values"]:
+                    raise ValueError("Текущие DNS изменены извне. Сверьте снимок и настройки Windows вручную.")
+                self.phase(op, "recovery")
+                self.write(current, family, previous)
+                current = self.current(before["guid"])
+                if desired(current, family) != previous or not unchanged(current, before, family):
+                    raise RuntimeError("Windows не подтвердила восстановление DNS.")
+            self.phase(op, "completed")
+            self.journal.unlink()
+            return current
+
+    def apply(self, preview, family, values, *, rollback=False, defer_completion=False):
+        with self.lock:
+            if self.pending():
+                raise RuntimeError("Требуется восстановление незавершённой операции DNS.")
+            return self._apply(preview, family, values, rollback, defer_completion)
+
+    def _apply(self, preview, family, values, rollback, defer_completion):
         values = addresses(family, values)
         identity = preview["guid"]
         before = self.current(identity)
         keys = (f"mode{family}", f"v{family}", "encryption")
-        if any(before[k] != preview[k] for k in keys):
+        if any(before[k] != preview[k] for k in keys) or not unchanged(before, preview, family):
             raise ValueError("Настройки изменились после просмотра. Обновите адаптер.")
         if before[keys[0]] not in ("auto", "manual") or before["encryption"] is None:
             raise ValueError("Нельзя достоверно сохранить исходную конфигурацию.")
         if before["encryption"]:
             raise ValueError("У адаптера индивидуальные настройки шифрования. Откройте параметры Windows, чтобы сохранить их при изменении DNS.")
+        desired(before, family)
         path = self.path(identity, family)
         if not path.exists():
-            atomic(path, before)
+            atomic(path, seal(before))
         else:
             self.saved(identity, family)  # A damaged original must never be overwritten.
-        if not rollback:
-            atomic(path.with_suffix(".previous.json"), before)
-        self.write(before, family, values)
+        op = dict(before=before, family=family, values=values, rollback=rollback)
+        self.phase(op, "prepared")
+        self.phase(op, "applying")
+        try:
+            self.write(before, family, values)
+        except PermissionError:
+            self.journal.unlink()
+            raise
+        except Exception:
+            self.phase(op, "recovery")
+            raise
+        self.phase(op, "verifying")
         try:
             after = self.current(identity)
+            if desired(after, family) != values or not unchanged(after, before, family):
+                raise ValueError("состояние адаптера отличается от ожидаемого")
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-            raise RuntimeError("Повторное чтение Windows не удалось: " + str(exc)) from exc
-        if after[keys[0]] != ("manual" if values else "auto") or (values and addresses(family, after[keys[1]]) != values):
-            raise RuntimeError("Повторное чтение Windows не подтвердило изменение.")
+            self.phase(op, "recovery")
+            raise RuntimeError("Повторное чтение Windows не подтвердило изменение: " + str(exc)) from exc
+        if not defer_completion:
+            self.complete()
         return after
 
     def saved(self, identity, family, previous=False):
@@ -262,10 +438,10 @@ class Manager:
             path = path.with_suffix(".previous.json")
         if not path.exists():
             raise ValueError("Для этого адаптера и семейства ещё нет резервной копии.")
-        data = json.loads(path.read_text("utf-8"))
-        if data["guid"] != identity or data[f"mode{family}"] not in ("auto", "manual"):
+        data = validated(path, legacy=True)
+        if data.get("guid") != identity or data.get(f"mode{family}") not in ("auto", "manual"):
             raise ValueError("Недопустимая резервная копия.")
-        return addresses(family, data[f"v{family}"]) if data[f"mode{family}"] == "manual" else []
+        return desired(data, family)
 
 
 def supports_doh():

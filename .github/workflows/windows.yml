@@ -1,24 +1,37 @@
 name: Windows executable
-on: [push, workflow_dispatch]
+on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
 jobs:
-  build:
+  quality:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: '3.14'
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14.4'
           architecture: x64
-      - name: Test, package and launch
-        shell: pwsh
-        run: ./build.ps1
-      - uses: actions/upload-artifact@v4
+      - run: python -m pip install --require-hashes --only-binary=:all: -r requirements-win314.lock
+      - run: python -m pip check
+      - run: python -m ruff check --select F,E9 app main.py tests tools
+      - run: python -m pytest -q
+  build:
+    needs: quality
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          name: DNS-Pilot-Windows-x64
-          path: |
-            dist/DNS Pilot.exe
-            README.md
-            GUIDE.md
-            MANUAL-TESTS.md
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14.4'
+          architecture: x64
+      - run: ./build.ps1
+        shell: pwsh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: DNS-Pilot-1.2.0-Windows-x64
+          path: dist/1.2.0/
+          if-no-files-found: error
